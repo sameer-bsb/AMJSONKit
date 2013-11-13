@@ -106,9 +106,6 @@
 #include <math.h>
 #include <limits.h>
 #include <objc/runtime.h>
-#include <libkern/OSAtomic.h>
-#include <dlfcn.h>
-#include <zlib.h>
 
 #import "JSONKit.h"
 
@@ -127,12 +124,20 @@
 #import <Foundation/NSNull.h>
 #import <Foundation/NSObjCRuntime.h>
 
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+
 #ifdef JK_ENABLE_CF_TRANSFER_OWNERSHIP_CALLBACKS
 #warning As of JSONKit v1.4, JK_ENABLE_CF_TRANSFER_OWNERSHIP_CALLBACKS is no longer required.  It is no longer a valid option.
 #endif
 
 #ifdef __OBJC_GC__
 #error JSONKit does not support Objective-C Garbage Collection
+#endif
+
+#if __has_feature(objc_arc)
+#error JSONKit does not support Objective-C Automatic Reference Counting (ARC)
 #endif
 
 // The following checks are really nothing more than sanity checks.
@@ -605,17 +610,52 @@ static int jk_encode_add_atom_to_buffer(JKEncodeState *encodeState, void *object
 JK_STATIC_INLINE size_t jk_min(size_t a, size_t b);
 JK_STATIC_INLINE size_t jk_max(size_t a, size_t b);
 JK_STATIC_INLINE JKHash calculateHash(JKHash currentHash, unsigned char c);
-static void jk_NSErrorWithFormat(NSError **error, NSString *domain, NSInteger errorCode, NSString *format, ...);
-
-static int jk_zlib_init(void);
-static id jk_zlib_decompress(const unsigned char *bytes, size_t length, NSError **error);
-static id jk_zlib_compress  (const unsigned char *bytes, size_t length, NSError **error);
 
 // JSONKit v1.4 used both a JKArray : NSArray and JKMutableArray : NSMutableArray, and the same for the dictionary collection type.
 // However, Louis Gerbarg (via cocoa-dev) pointed out that Cocoa / Core Foundation actually implements only a single class that inherits from the 
 // mutable version, and keeps an ivar bit for whether or not that instance is mutable.  This means that the immutable versions of the collection
 // classes receive the mutating methods, but this is handled by having those methods throw an exception when the ivar bit is set to immutable.
 // We adopt the same strategy here.  It's both cleaner and gets rid of the method swizzling hackery used in JSONKit v1.4.
+
+
+// This is a workaround for issue #23 https://github.com/johnezang/JSONKit/pull/23
+// Basically, there seem to be a problem with using +load in static libraries on iOS.  However, __attribute__ ((constructor)) does work correctly.
+// Since we do not require anything "special" that +load provides, and we can accomplish the same thing using __attribute__ ((constructor)), the +load logic was moved here.
+
+static Class                               _JKArrayClass                           = NULL;
+static size_t                              _JKArrayInstanceSize                    = 0UL;
+static Class                               _JKDictionaryClass                      = NULL;
+static size_t                              _JKDictionaryInstanceSize               = 0UL;
+
+// For JSONDecoder...
+static Class                               _jk_NSNumberClass                       = NULL;
+static NSNumberAllocImp                    _jk_NSNumberAllocImp                    = NULL;
+static NSNumberInitWithUnsignedLongLongImp _jk_NSNumberInitWithUnsignedLongLongImp = NULL;
+
+extern void jk_collectionClassLoadTimeInitialization(void) __attribute__ ((constructor));
+
+void jk_collectionClassLoadTimeInitialization(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init]; // Though technically not required, the run time environment at load time initialization may be less than ideal.
+  
+  _JKArrayClass             = objc_getClass("JKArray");
+  _JKArrayInstanceSize      = jk_max(16UL, class_getInstanceSize(_JKArrayClass));
+  
+  _JKDictionaryClass        = objc_getClass("JKDictionary");
+  _JKDictionaryInstanceSize = jk_max(16UL, class_getInstanceSize(_JKDictionaryClass));
+  
+  // For JSONDecoder...
+  _jk_NSNumberClass = [NSNumber class];
+  _jk_NSNumberAllocImp = (NSNumberAllocImp)[NSNumber methodForSelector:@selector(alloc)];
+  
+  // Hacktacular.  Need to do it this way due to the nature of class clusters.
+  id temp_NSNumber = [NSNumber alloc];
+  _jk_NSNumberInitWithUnsignedLongLongImp = (NSNumberInitWithUnsignedLongLongImp)[temp_NSNumber methodForSelector:@selector(initWithUnsignedLongLong:)];
+  [[temp_NSNumber init] release];
+  temp_NSNumber = NULL;
+  
+  [pool release]; pool = NULL;
+}
+
 
 #pragma mark -
 @interface JKArray : NSMutableArray <NSCopying, NSMutableCopying, NSFastEnumeration> {
@@ -625,19 +665,6 @@ static id jk_zlib_compress  (const unsigned char *bytes, size_t length, NSError 
 @end
 
 @implementation JKArray
-
-static Class _JKArrayClass         = NULL;
-static size_t _JKArrayInstanceSize = 0UL;
-
-+ (void)load
-{
-  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init]; // Though technically not required, the run time environment at +load time may be less than ideal.
-
-  _JKArrayClass        = objc_getClass("JKArray");
-  _JKArrayInstanceSize = jk_max(16UL, class_getInstanceSize(_JKArrayClass));
-
-  [pool release]; pool = NULL;
-}
 
 + (id)allocWithZone:(NSZone *)zone
 {
@@ -650,7 +677,7 @@ static JKArray *_JKArrayCreate(id *objects, NSUInteger count, BOOL mutableCollec
   NSCParameterAssert((objects != NULL) && (_JKArrayClass != NULL) && (_JKArrayInstanceSize > 0UL));
   JKArray *array = NULL;
   if(JK_EXPECT_T((array = (JKArray *)calloc(1UL, _JKArrayInstanceSize)) != NULL)) { // Directly allocate the JKArray instance via calloc.
-    array->isa      = _JKArrayClass;
+      object_setClass(array, _JKArrayClass);
     if((array = [array init]) == NULL) { return(NULL); }
     array->capacity = count;
     array->count    = count;
@@ -665,14 +692,14 @@ static JKArray *_JKArrayCreate(id *objects, NSUInteger count, BOOL mutableCollec
 static void _JKArrayInsertObjectAtIndex(JKArray *array, id newObject, NSUInteger objectIndex) {
   NSCParameterAssert((array != NULL) && (array->objects != NULL) && (array->count <= array->capacity) && (objectIndex <= array->count) && (newObject != NULL));
   if(!((array != NULL) && (array->objects != NULL) && (objectIndex <= array->count) && (newObject != NULL))) { [newObject autorelease]; return; }
-  array->count++;
-  if(array->count >= array->capacity) {
-    array->capacity += 16UL;
+  if((array->count + 1UL) >= array->capacity) {
     id *newObjects = NULL;
-    if((newObjects = (id *)realloc(array->objects, sizeof(id) * array->capacity)) == NULL) { [NSException raise:NSMallocException format:@"Unable to resize objects array."]; }
+    if((newObjects = (id *)realloc(array->objects, sizeof(id) * (array->capacity + 16UL))) == NULL) { [NSException raise:NSMallocException format:@"Unable to resize objects array."]; }
     array->objects = newObjects;
+    array->capacity += 16UL;
     memset(&array->objects[array->count], 0, sizeof(id) * (array->capacity - array->count));
   }
+  array->count++;
   if((objectIndex + 1UL) < array->count) { memmove(&array->objects[objectIndex + 1UL], &array->objects[objectIndex], sizeof(id) * ((array->count - 1UL) - objectIndex)); array->objects[objectIndex] = NULL; }
   array->objects[objectIndex] = newObject;
 }
@@ -687,11 +714,11 @@ static void _JKArrayReplaceObjectAtIndexWithObject(JKArray *array, NSUInteger ob
 }
 
 static void _JKArrayRemoveObjectAtIndex(JKArray *array, NSUInteger objectIndex) {
-  NSCParameterAssert((array != NULL) && (array->objects != NULL) && (array->count <= array->capacity) && (objectIndex < array->count) && (array->objects[objectIndex] != NULL));
-  if(!((array != NULL) && (array->objects != NULL) && (objectIndex < array->count) && (array->objects[objectIndex] != NULL))) { return; }
+  NSCParameterAssert((array != NULL) && (array->objects != NULL) && (array->count > 0UL) && (array->count <= array->capacity) && (objectIndex < array->count) && (array->objects[objectIndex] != NULL));
+  if(!((array != NULL) && (array->objects != NULL) && (array->count > 0UL) && (array->count <= array->capacity) && (objectIndex < array->count) && (array->objects[objectIndex] != NULL))) { return; }
   CFRelease(array->objects[objectIndex]);
   array->objects[objectIndex] = NULL;
-  if((objectIndex + 1UL) < array->count) { memmove(&array->objects[objectIndex], &array->objects[objectIndex + 1UL], sizeof(id) * ((array->count - 1UL) - objectIndex)); array->objects[array->count] = NULL; }
+  if((objectIndex + 1UL) < array->count) { memmove(&array->objects[objectIndex], &array->objects[objectIndex + 1UL], sizeof(id) * ((array->count - 1UL) - objectIndex)); array->objects[array->count - 1UL] = NULL; }
   array->count--;
 }
 
@@ -744,7 +771,11 @@ static void _JKArrayRemoveObjectAtIndex(JKArray *array, NSUInteger objectIndex) 
   if(mutations   == 0UL)   { [NSException raise:NSInternalInconsistencyException format:@"*** -[%@ %@]: mutating method sent to immutable object", NSStringFromClass([self class]), NSStringFromSelector(_cmd)]; }
   if(anObject    == NULL)  { [NSException raise:NSInvalidArgumentException       format:@"*** -[%@ %@]: attempt to insert nil",                    NSStringFromClass([self class]), NSStringFromSelector(_cmd)]; }
   if(objectIndex >  count) { [NSException raise:NSRangeException                 format:@"*** -[%@ %@]: index (%lu) beyond bounds (%lu)",          NSStringFromClass([self class]), NSStringFromSelector(_cmd), objectIndex, count + 1UL]; }
+#ifdef __clang_analyzer__
+  [anObject retain]; // Stupid clang analyzer...  Issue #19.
+#else
   anObject = [anObject retain];
+#endif
   _JKArrayInsertObjectAtIndex(self, anObject, objectIndex);
   mutations = (mutations == NSUIntegerMax) ? 1UL : mutations + 1UL;
 }
@@ -762,7 +793,11 @@ static void _JKArrayRemoveObjectAtIndex(JKArray *array, NSUInteger objectIndex) 
   if(mutations   == 0UL)   { [NSException raise:NSInternalInconsistencyException format:@"*** -[%@ %@]: mutating method sent to immutable object", NSStringFromClass([self class]), NSStringFromSelector(_cmd)]; }
   if(anObject    == NULL)  { [NSException raise:NSInvalidArgumentException       format:@"*** -[%@ %@]: attempt to insert nil",                    NSStringFromClass([self class]), NSStringFromSelector(_cmd)]; }
   if(objectIndex >= count) { [NSException raise:NSRangeException                 format:@"*** -[%@ %@]: index (%lu) beyond bounds (%lu)",          NSStringFromClass([self class]), NSStringFromSelector(_cmd), objectIndex, count]; }
+#ifdef __clang_analyzer__
+  [anObject retain]; // Stupid clang analyzer...  Issue #19.
+#else
   anObject = [anObject retain];
+#endif
   _JKArrayReplaceObjectAtIndexWithObject(self, objectIndex, anObject);
   mutations = (mutations == NSUIntegerMax) ? 1UL : mutations + 1UL;
 }
@@ -770,13 +805,13 @@ static void _JKArrayRemoveObjectAtIndex(JKArray *array, NSUInteger objectIndex) 
 - (id)copyWithZone:(NSZone *)zone
 {
   NSParameterAssert((objects != NULL) && (count <= capacity));
-  return((mutations == 0UL) ? [self retain] : [[NSArray allocWithZone:zone] initWithObjects:objects count:count]);
+  return((mutations == 0UL) ? [self retain] : [(NSArray *)[NSArray allocWithZone:zone] initWithObjects:objects count:count]);
 }
 
 - (id)mutableCopyWithZone:(NSZone *)zone
 {
   NSParameterAssert((objects != NULL) && (count <= capacity));
-  return([[NSMutableArray allocWithZone:zone] initWithObjects:objects count:count]);
+  return([(NSMutableArray *)[NSMutableArray allocWithZone:zone] initWithObjects:objects count:count]);
 }
 
 @end
@@ -813,7 +848,7 @@ static void _JKArrayRemoveObjectAtIndex(JKArray *array, NSUInteger objectIndex) 
 - (NSArray *)allObjects
 {
   NSParameterAssert(collection != NULL);
-  NSUInteger count = [collection count], atObject = 0UL;
+  NSUInteger count = [(NSDictionary *)collection count], atObject = 0UL;
   id         objects[count];
 
   while((objects[atObject] = [self nextObject]) != NULL) { NSParameterAssert(atObject < count); atObject++; }
@@ -843,19 +878,6 @@ static void _JKArrayRemoveObjectAtIndex(JKArray *array, NSUInteger objectIndex) 
 @end
 
 @implementation JKDictionary
-
-static Class  _JKDictionaryClass        = NULL;
-static size_t _JKDictionaryInstanceSize = 0UL;
-
-+ (void)load
-{
-  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init]; // Though technically not required, the run time environment at +load time may be less than ideal.
-
-  _JKDictionaryClass        = objc_getClass("JKDictionary");
-  _JKDictionaryInstanceSize = jk_max(16UL, class_getInstanceSize(_JKDictionaryClass));
-
-  [pool release]; pool = NULL;
-}
 
 + (id)allocWithZone:(NSZone *)zone
 {
@@ -904,8 +926,8 @@ static JKDictionary *_JKDictionaryCreate(id *keys, NSUInteger *keyHashes, id *ob
   NSCParameterAssert((keys != NULL) && (keyHashes != NULL) && (objects != NULL) && (_JKDictionaryClass != NULL) && (_JKDictionaryInstanceSize > 0UL));
   JKDictionary *dictionary = NULL;
   if(JK_EXPECT_T((dictionary = (JKDictionary *)calloc(1UL, _JKDictionaryInstanceSize)) != NULL)) { // Directly allocate the JKDictionary instance via calloc.
-    dictionary->isa      = _JKDictionaryClass;
-    if((dictionary = [dictionary init]) == NULL) { return(NULL); }
+      object_setClass(dictionary, _JKDictionaryClass);
+      if((dictionary = [dictionary init]) == NULL) { return(NULL); }
     dictionary->capacity = _JKDictionaryCapacityForCount(count);
     dictionary->count    = 0UL;
     
@@ -945,11 +967,30 @@ static NSUInteger _JKDictionaryCapacity(JKDictionary *dictionary) {
 }
 
 static void _JKDictionaryRemoveObjectWithEntry(JKDictionary *dictionary, JKHashTableEntry *entry) {
-  NSCParameterAssert((dictionary != NULL) && (entry != NULL) && (entry->key != NULL) && (entry->object != NULL) && (dictionary->count > 0UL));
+  NSCParameterAssert((dictionary != NULL) && (entry != NULL) && (entry->key != NULL) && (entry->object != NULL) && (dictionary->count > 0UL) && (dictionary->count <= dictionary->capacity));
   CFRelease(entry->key);    entry->key    = NULL;
   CFRelease(entry->object); entry->object = NULL;
   entry->keyHash = 0UL;
   dictionary->count--;
+  // In order for certain invariants that are used to speed up the search for a particular key, we need to "re-add" all the entries in the hash table following this entry until we hit a NULL entry.
+  NSUInteger removeIdx = entry - dictionary->entry, idx = 0UL;
+  NSCParameterAssert((removeIdx < dictionary->capacity));
+  for(idx = 0UL; idx < dictionary->capacity; idx++) {
+    NSUInteger entryIdx = (removeIdx + idx + 1UL) % dictionary->capacity;
+    JKHashTableEntry *atEntry = &dictionary->entry[entryIdx];
+    if(atEntry->key == NULL) { break; }
+    NSUInteger keyHash = atEntry->keyHash;
+    id key = atEntry->key, object = atEntry->object;
+    NSCParameterAssert(object != NULL);
+    atEntry->keyHash = 0UL;
+    atEntry->key     = NULL;
+    atEntry->object  = NULL;
+    NSUInteger addKeyEntry = keyHash % dictionary->capacity, addIdx = 0UL;
+    for(addIdx = 0UL; addIdx < dictionary->capacity; addIdx++) {
+      JKHashTableEntry *atAddEntry = &dictionary->entry[((addKeyEntry + addIdx) % dictionary->capacity)];
+      if(JK_EXPECT_T(atAddEntry->key == NULL)) { NSCParameterAssert((atAddEntry->keyHash == 0UL) && (atAddEntry->object == NULL)); atAddEntry->key = key; atAddEntry->object = object; atAddEntry->keyHash = keyHash; break; }
+    }
+  }
 }
 
 static void _JKDictionaryAddObject(JKDictionary *dictionary, NSUInteger keyHash, id key, id object) {
@@ -959,7 +1000,7 @@ static void _JKDictionaryAddObject(JKDictionary *dictionary, NSUInteger keyHash,
     NSUInteger entryIdx = (keyEntry + idx) % dictionary->capacity;
     JKHashTableEntry *atEntry = &dictionary->entry[entryIdx];
     if(JK_EXPECT_F(atEntry->keyHash == keyHash) && JK_EXPECT_T(atEntry->key != NULL) && (JK_EXPECT_F(key == atEntry->key) || JK_EXPECT_F(CFEqual(atEntry->key, key)))) { _JKDictionaryRemoveObjectWithEntry(dictionary, atEntry); }
-    if(JK_EXPECT_T(atEntry->key == NULL)) { atEntry->key = key; atEntry->object = object; atEntry->keyHash = keyHash; dictionary->count++; return; }
+    if(JK_EXPECT_T(atEntry->key == NULL)) { NSCParameterAssert((atEntry->keyHash == 0UL) && (atEntry->object == NULL)); atEntry->key = key; atEntry->object = object; atEntry->keyHash = keyHash; dictionary->count++; return; }
   }
 
   // We should never get here.  If we do, we -release the key / object because it's our responsibility.
@@ -1072,21 +1113,6 @@ JK_STATIC_INLINE size_t jk_max(size_t a, size_t b) { return((a > b) ? a : b); }
 
 JK_STATIC_INLINE JKHash calculateHash(JKHash currentHash, unsigned char c) { return(((currentHash << 5) + currentHash) + c); }
 
-static void jk_NSErrorWithFormat(NSError **error, NSString *domain, NSInteger errorCode, NSString *format, ...) {
-  NSCParameterAssert((domain != NULL) && (format != NULL));
-  if(error == NULL) { return; }
-  
-  va_list varArgsList;
-  va_start(varArgsList, format);
-  NSString *formatString = [[[NSString alloc] initWithFormat:format arguments:varArgsList] autorelease];
-  va_end(varArgsList);
-  
-  *error = [NSError errorWithDomain:domain code:errorCode userInfo:
-                      [NSDictionary dictionaryWithObjectsAndKeys:
-                                                                 formatString, NSLocalizedDescriptionKey,
-                                                                 NULL]];
-}
-
 static void jk_error(JKParseState *parseState, NSString *format, ...) {
   NSCParameterAssert((parseState != NULL) && (format != NULL));
 
@@ -1119,158 +1145,6 @@ static void jk_error(JKParseState *parseState, NSString *format, ...) {
                                                  //carretString, @"JKErrorLine1Key",
                                                                               NULL]];
   }
-}
-
-#pragma mark -
-#pragma mark Compression - zlib interface
-
-static volatile OSSpinLock  _jk_zlib_spinlock   = OS_SPINLOCK_INIT;
-static NSInteger            _jk_zlib_initalized = 0L; // -1 == unrecoverable linking error (can't use zlib), 0 = uninitialized, 1 = good to go.
-static void                *_jk_dlhandle        = NULL;
-
-// These are function pointer trampolines that are placeholders for their respective zlib functions.
-// Think of it as a form of weak linking.  Or "You don't have to link to libz in Xcode, we'll do it for you on the fly!"
-//
-// NOTE: The zlib.h header defines the ...Init* functions as a pre-processor macro that automatically passes the zlib.h ZLIB_VERSION
-//       and sizeof(z_stream) as arguments.  We must emulate this behavior.
-//
-// IMPORTANT: The behavior is undefined if any of these trampolines are used when _jk_zlib_initalized != 1.
-//
-static int   (*jk_deflateInit2_) (z_streamp strm, int  level, int  method, int windowBits, int memLevel, int strategy, const char *version, int stream_size); // NOTE: version == ZLIB_VERSIOn, stream_size == sizeof(z_stream)
-static uLong (*jk_deflateBound)  (z_streamp strm, uLong sourceLen);
-static int   (*jk_deflate)       (z_streamp strm, int flush);
-static int   (*jk_deflateEnd)    (z_streamp strm);
-static int   (*jk_inflateInit2_) (z_streamp strm, int  windowBits, const char *version, int stream_size); // NOTE: version == ZLIB_VERSIOn, stream_size == sizeof(z_stream)
-static int   (*jk_inflate)       (z_streamp strm, int flush);
-static int   (*jk_inflateEnd)    (z_streamp strm);
-
-// Binds the the zlib function pointer trampolines to their dynamic library addresses.
-static int jk_zlib_init(void) {
-  if(_jk_zlib_initalized == 0L) {
-    OSSpinLockLock(&_jk_zlib_spinlock);
-    if(_jk_zlib_initalized != 0L) { goto exitUnlock; } // Someone changed _jk_zlib_initalized between our first test and now, when we have the lock.
-    
-    _jk_dlhandle = dlopen("libz.dylib", RTLD_LAZY);
-    
-    if((jk_deflateInit2_ = (int  (*)(z_streamp strm, int  level, int  method, int windowBits, int memLevel, int strategy, const char *version, int stream_size)) dlsym(_jk_dlhandle, "deflateInit2_")) == NULL) { _jk_zlib_initalized = -1L; goto exitUnlock; }
-    if((jk_deflateBound  = (uLong(*)(z_streamp strm, uLong sourceLen))                                                                                           dlsym(_jk_dlhandle, "deflateBound"))  == NULL) { _jk_zlib_initalized = -1L; goto exitUnlock; }
-    if((jk_deflate       = (int  (*)(z_streamp strm, int flush))                                                                                                 dlsym(_jk_dlhandle, "deflate"))       == NULL) { _jk_zlib_initalized = -1L; goto exitUnlock; }
-    if((jk_deflateEnd    = (int  (*)(z_streamp strm))                                                                                                            dlsym(_jk_dlhandle, "deflateEnd"))    == NULL) { _jk_zlib_initalized = -1L; goto exitUnlock; }
-    
-    if((jk_inflateInit2_ = (int  (*)(z_streamp strm, int  windowBits, const char *version, int stream_size))                                                     dlsym(_jk_dlhandle, "inflateInit2_")) == NULL) { _jk_zlib_initalized = -1L; goto exitUnlock; }
-    if((jk_inflate       = (int  (*)(z_streamp strm, int flush))                                                                                                 dlsym(_jk_dlhandle, "inflate"))       == NULL) { _jk_zlib_initalized = -1L; goto exitUnlock; }
-    if((jk_inflateEnd    = (int  (*)(z_streamp strm))                                                                                                            dlsym(_jk_dlhandle, "inflateEnd"))    == NULL) { _jk_zlib_initalized = -1L; goto exitUnlock; }
-    
-    _jk_zlib_initalized = 1L;
-    
-  exitUnlock:
-    if((_jk_zlib_initalized == -1L) && (_jk_dlhandle != NULL)) { dlclose(_jk_dlhandle); _jk_dlhandle = NULL; }
-    OSSpinLockUnlock(&_jk_zlib_spinlock);
-  }
-  
-  return(_jk_zlib_initalized);
-}
-
-
-static id jk_zlib_compress(const unsigned char *bytes, size_t length, NSError **error) {
-  NSCParameterAssert((bytes != NULL));
-  
-  if((_jk_zlib_initalized <= 0L) && (jk_zlib_init() == -1L)) { jk_NSErrorWithFormat(error, @"JKErrorDomain", -1L, @"Unable to compress:  Error linking to the zlib dynamic library."); return(NULL); }
-  
-  z_stream zlibStream;
-  memset(&zlibStream, 0, sizeof(z_stream));
-  
-  zlibStream.zalloc   = Z_NULL;
-  zlibStream.zfree    = Z_NULL;
-  zlibStream.avail_in = length;
-  zlibStream.next_in  = (Bytef *)bytes;
-  
-  int zlibResult = 0;
-  if((zlibResult = jk_deflateInit2_(&zlibStream, 1, Z_DEFLATED, (15 + 16), 8, Z_DEFAULT_STRATEGY, ZLIB_VERSION, (int)sizeof(z_stream))) != Z_OK) { jk_NSErrorWithFormat(error, @"JKErrorDomain", zlibResult, @"Error initializing zlib deflate.%s%s", (zlibStream.msg == NULL) ? "": "  zlib error message: ", (zlibStream.msg == NULL) ? "" : zlibStream.msg); return(NULL); }
-  
-  uLong compressedUpperBound = jk_deflateBound(&zlibStream, length) + 1024UL;
-  
-  NSMutableData *mutableData = NULL;
-  if(((mutableData = [NSMutableData dataWithLength:compressedUpperBound]) == NULL) || ([mutableData mutableBytes] == NULL)) { jk_NSErrorWithFormat(error, @"JKErrorDomain", zlibResult, @"Unable to allocate buffer."); goto errorExit; }
-  
-  zlibStream.avail_out = [mutableData length];
-  zlibStream.next_out  = (Bytef *)[mutableData mutableBytes];
-  
-  while((zlibResult = jk_deflate(&zlibStream, Z_FINISH)) != Z_STREAM_END) {
-    switch(zlibResult) {
-      case Z_OK:
-        compressedUpperBound = jk_deflateBound(&zlibStream, zlibStream.total_out) + 8192UL;
-        NSCParameterAssert(compressedUpperBound > [mutableData length]);
-        [mutableData setLength:compressedUpperBound];
-        if([mutableData mutableBytes] == NULL) { jk_NSErrorWithFormat(error, @"JKErrorDomain", -1L, @"Unable to resize buffer."); goto errorExit; }
-        zlibStream.avail_out =          [mutableData length]        - zlibStream.total_out;
-        zlibStream.next_out  = ((Byte *)[mutableData mutableBytes]) + zlibStream.total_out;
-        break;
-        
-      default:                                            jk_NSErrorWithFormat(error, @"JKErrorDomain", zlibResult, @"Error deflating buffer.%s%s", (zlibStream.msg == NULL) ? "": "  zlib error message: ", (zlibStream.msg == NULL) ? "" : zlibStream.msg); goto errorExit; break;
-    }
-  }
-  
-  if((zlibResult = jk_deflateEnd(&zlibStream)) != Z_OK) { jk_NSErrorWithFormat(error, @"JKErrorDomain", zlibResult, @"Error deflating buffer.%s%s", (zlibStream.msg == NULL) ? "": "  zlib error message: ", (zlibStream.msg == NULL) ? "" : zlibStream.msg); goto errorExit; }
-  
-  [mutableData setLength:zlibStream.total_out];
-  
-  return(mutableData);
-  
-errorExit:
-  if(mutableData != NULL) { [mutableData setLength:0UL]; }
-  jk_deflateEnd(&zlibStream);
-  return(NULL);
-}
-
-static id jk_zlib_decompress(const unsigned char *bytes, size_t length, NSError **error) {
-  NSCParameterAssert((bytes != NULL));
-  
-  if((_jk_zlib_initalized <= 0L) && (jk_zlib_init() == -1L)) { jk_NSErrorWithFormat(error, @"JKErrorDomain", -1L, @"Unable to decompress:  Error linking to the zlib dynamic library."); return(NULL); }
-  
-  z_stream zlibStream;
-  memset(&zlibStream, 0, sizeof(z_stream));
-  
-  size_t decompressedLength = 0UL;
-  if((length > 6UL) && (bytes[0] == 0x1f) && (bytes[1] == 0x8b)) { decompressedLength = ((bytes[(length - 1UL) - 0UL] << 24) | (bytes[(length - 1UL) - 1UL] << 16) | (bytes[(length - 1UL) - 2UL] << 8) | (bytes[(length - 1UL) - 3UL] << 0)); }
-  else                                                           { jk_NSErrorWithFormat(error, @"JKErrorDomain", -1L, @"NSData does not appear to compressed with gzip."); return(NULL); }
-  
-  NSMutableData *mutableData = NULL;
-  if(((mutableData = [NSMutableData dataWithLength:decompressedLength]) == NULL) || ([mutableData mutableBytes] == NULL)) { jk_NSErrorWithFormat(error, @"JKErrorDomain", -1L, @"Unable to allocate buffer."); return(NULL); }
-  
-  zlibStream.zalloc    = Z_NULL;
-  zlibStream.zfree     = Z_NULL;
-  zlibStream.avail_in  = length;
-  zlibStream.next_in   = (Bytef *)bytes;
-  zlibStream.avail_out = [mutableData length];
-  zlibStream.next_out  = (Bytef *)[mutableData mutableBytes];
-  
-  int zlibResult = 0;
-  if((zlibResult = jk_inflateInit2_(&zlibStream, (15 + 32), ZLIB_VERSION, (int)sizeof(z_stream))) != Z_OK) { jk_NSErrorWithFormat(error, @"JKErrorDomain", zlibResult, @"Error initializing zlib inflate.%s%s", (zlibStream.msg == NULL) ? "": "  zlib error message: ", (zlibStream.msg == NULL) ? "" : zlibStream.msg); goto errorExit; }
-  
-  while((zlibResult = jk_inflate(&zlibStream, Z_FINISH)) != Z_STREAM_END) {
-    switch(zlibResult) {
-      case Z_OK:
-        [mutableData setLength:([mutableData length] / 4UL)];
-        if([mutableData mutableBytes] == NULL) { jk_NSErrorWithFormat(error, @"JKErrorDomain", -1L, @"Unable to resize buffer."); goto errorExit; }
-        zlibStream.avail_out =          [mutableData length]        - zlibStream.total_out;
-        zlibStream.next_out  = ((Byte *)[mutableData mutableBytes]) + zlibStream.total_out;
-        break;
-        
-      default:                                            jk_NSErrorWithFormat(error, @"JKErrorDomain", zlibResult, @"Error inflating buffer.%s%s", (zlibStream.msg == NULL) ? "": "  zlib error message: ", (zlibStream.msg == NULL) ? "" : zlibStream.msg); goto errorExit; break;
-    }
-  }
-  
-  if((zlibResult = jk_inflateEnd(&zlibStream)) != Z_OK) { jk_NSErrorWithFormat(error, @"JKErrorDomain", zlibResult, @"Error inflating buffer.%s%s", (zlibStream.msg == NULL) ? "": "  zlib error message: ", (zlibStream.msg == NULL) ? "" : zlibStream.msg); goto errorExit; }
-  
-  [mutableData setLength:zlibStream.total_out];
-  
-  return(mutableData);
-  
-errorExit:
-  if(mutableData != NULL) { [mutableData setLength:0UL]; }
-  jk_inflateEnd(&zlibStream);
-  return(NULL);
 }
 
 #pragma mark -
@@ -1707,7 +1581,7 @@ static int jk_parse_string(JKParseState *parseState) {
           break;
 
         case JSONStringStateEscapedNeedEscapeForSurrogate:
-          if((currentChar == '\\')) { stringState = JSONStringStateEscapedNeedEscapedUForSurrogate; }
+          if(currentChar == '\\') { stringState = JSONStringStateEscapedNeedEscapedUForSurrogate; }
           else { 
             if((parseState->parseOptionFlags & JKParseOptionLooseUnicode) == 0) { jk_error(parseState, @"Required a second \\u Unicode escape sequence following a surrogate \\u Unicode escape sequence."); stringState = JSONStringStateError; goto finishedParsing; }
             else { stringState = JSONStringStateParsing; atStringCharacter--;    if(jk_string_add_unicodeCodePoint(parseState, UNI_REPLACEMENT_CHAR, &tokenBufferIdx, &stringHash)) { jk_error(parseState, @"Internal error: Unable to add UTF8 sequence to internal string buffer. %@ line #%ld", [NSString stringWithUTF8String:__FILE__], (long)__LINE__); stringState = JSONStringStateError; goto finishedParsing; } }
@@ -1758,7 +1632,7 @@ static int jk_parse_number(JKParseState *parseState) {
   const unsigned char *numberStart       = JK_AT_STRING_PTR(parseState);
   const unsigned char *endOfBuffer       = JK_END_STRING_PTR(parseState);
   const unsigned char *atNumberCharacter = NULL;
-  int                  numberState       = JSONNumberStateWholeNumberStart, isFloatingPoint = 0, isNegative = 0, isHexFloatingPoint = 0, backup = 0;
+  int                  numberState       = JSONNumberStateWholeNumberStart, isFloatingPoint = 0, isNegative = 0, backup = 0;
   size_t               startingIndex     = parseState->atIndex;
   
   for(atNumberCharacter = numberStart; (JK_EXPECT_T(atNumberCharacter < endOfBuffer)) && (JK_EXPECT_T(!(JK_EXPECT_F(numberState == JSONNumberStateFinished) || JK_EXPECT_F(numberState == JSONNumberStateError)))); atNumberCharacter++) {
@@ -1771,17 +1645,13 @@ static int jk_parse_number(JKParseState *parseState) {
                                        else                                                     { /* XXX Add error message */                        numberState = JSONNumberStateError;                                      break; }
       case JSONNumberStateExponentStart:    if(  (currentChar == '+') || (currentChar == '-'))                                                     { numberState = JSONNumberStateExponentPlusMinus;                          break; }
       case JSONNumberStateFractionalNumberStart:
-      case JSONNumberStateExponentPlusMinus:if(!(((currentChar >= '0') && (currentChar <= '9')) ||
-                                                 (isHexFloatingPoint && ((lowerCaseCC >= 'a') && (lowerCaseCC <= 'f')))))                          { numberState = JSONNumberStateError;                                      break; }
-                                       else {                                     if(numberState == JSONNumberStateFractionalNumberStart)          { numberState = JSONNumberStateFractionalNumber; }
-                                                                                  else                                                             { numberState = JSONNumberStateExponent;         }                         break; }
-      case JSONNumberStateWholeNumberZero:  if(((parseState->parseOptionFlags & JKParseOptionExtendedFloatingPoint) != 0) && (lowerCaseCC == 'x')) { numberState = JSONNumberStateWholeNumber;           isFloatingPoint = 1; isHexFloatingPoint = 1; break; }
-      case JSONNumberStateWholeNumber:      if   ( currentChar == '.')                                                                             { numberState = JSONNumberStateFractionalNumberStart; isFloatingPoint = 1; break; }
-      case JSONNumberStateFractionalNumber: if(  (!isHexFloatingPoint && (lowerCaseCC == 'e')) ||
-                                                 ( isHexFloatingPoint && (lowerCaseCC == 'p')))                                                    { numberState = JSONNumberStateExponentStart;         isFloatingPoint = 1; isHexFloatingPoint = 2; break; }
-      case JSONNumberStateExponent:         if(!((                       (currentChar >= '0') && (currentChar <= '9') )  ||
-                                                 (isHexFloatingPoint && ((lowerCaseCC >= 'a') && (lowerCaseCC <= 'f')))) || 
-                                                (numberState == JSONNumberStateWholeNumberZero))                                                   { numberState = JSONNumberStateFinished;              backup          = 1; break; }
+      case JSONNumberStateExponentPlusMinus:if(!((currentChar >= '0') && (currentChar <= '9'))) { /* XXX Add error message */                        numberState = JSONNumberStateError;                                      break; }
+                                       else {                                              if(numberState == JSONNumberStateFractionalNumberStart) { numberState = JSONNumberStateFractionalNumber; }
+                                                                                           else                                                    { numberState = JSONNumberStateExponent;         }                         break; }
+      case JSONNumberStateWholeNumberZero:
+      case JSONNumberStateWholeNumber:      if   (currentChar == '.')                                                                              { numberState = JSONNumberStateFractionalNumberStart; isFloatingPoint = 1; break; }
+      case JSONNumberStateFractionalNumber: if   (lowerCaseCC == 'e')                                                                              { numberState = JSONNumberStateExponentStart;         isFloatingPoint = 1; break; }
+      case JSONNumberStateExponent:         if(!((currentChar >= '0') && (currentChar <= '9')) || (numberState == JSONNumberStateWholeNumberZero)) { numberState = JSONNumberStateFinished;              backup          = 1; break; }
         break;
       default:                                                                                    /* XXX Add error message */                        numberState = JSONNumberStateError;                                      break;
     }
@@ -1790,11 +1660,6 @@ static int jk_parse_number(JKParseState *parseState) {
   parseState->token.tokenPtrRange.ptr    = parseState->stringBuffer.bytes.ptr + startingIndex;
   parseState->token.tokenPtrRange.length = (atNumberCharacter - parseState->token.tokenPtrRange.ptr) - backup;
   parseState->atIndex                    = (parseState->token.tokenPtrRange.ptr + parseState->token.tokenPtrRange.length) - parseState->stringBuffer.bytes.ptr;
-
-  if(JK_EXPECT_T(numberState == JSONNumberStateFinished) && (isHexFloatingPoint == 1)) {
-    jk_error(parseState, @"The value '%*.*s' is not a valid hexadecimal floating point number.", (int)parseState->token.tokenPtrRange.length, (int)parseState->token.tokenPtrRange.length, parseState->token.tokenPtrRange.ptr);
-    numberState = JSONNumberStateError;
-  }
 
   if(JK_EXPECT_T(numberState == JSONNumberStateFinished)) {
     unsigned char  numberTempBuf[parseState->token.tokenPtrRange.length + 4UL];
@@ -2139,7 +2004,7 @@ static void *jk_cachedObjects(JKParseState *parseState) {
   for(x = 0UL; x < JK_CACHE_PROBES; x++) {
     if(JK_EXPECT_F(parseState->cache.items[bucket].object == NULL)) { setBucket = 1UL; useableBucket = bucket; break; }
     
-    if((JK_EXPECT_T(parseState->cache.items[bucket].hash == parseState->token.value.hash)) && (JK_EXPECT_T(parseState->cache.items[bucket].size == parseState->token.value.ptrRange.length)) && (JK_EXPECT_T(parseState->cache.items[bucket].type == parseState->token.value.type)) && (JK_EXPECT_T(parseState->cache.items[bucket].bytes != NULL)) && (JK_EXPECT_T(strncmp((const char *)parseState->cache.items[bucket].bytes, (const char *)parseState->token.value.ptrRange.ptr, parseState->token.value.ptrRange.length) == 0U))) {
+    if((JK_EXPECT_T(parseState->cache.items[bucket].hash == parseState->token.value.hash)) && (JK_EXPECT_T(parseState->cache.items[bucket].size == parseState->token.value.ptrRange.length)) && (JK_EXPECT_T(parseState->cache.items[bucket].type == parseState->token.value.type)) && (JK_EXPECT_T(parseState->cache.items[bucket].bytes != NULL)) && (JK_EXPECT_T(memcmp(parseState->cache.items[bucket].bytes, parseState->token.value.ptrRange.ptr, parseState->token.value.ptrRange.length) == 0U))) {
       parseState->cache.age[bucket]     = (parseState->cache.age[bucket] << 1) | 1U;
       parseState->token.value.cacheItem = &parseState->cache.items[bucket];
       NSCParameterAssert(parseState->cache.items[bucket].object != NULL);
@@ -2209,26 +2074,6 @@ static void *jk_object_for_token(JKParseState *parseState) {
 
 #pragma mark -
 @implementation JSONDecoder
-
-static Class            _jk_NSNumberClass;
-static NSNumberAllocImp _jk_NSNumberAllocImp;
-static NSNumberInitWithUnsignedLongLongImp _jk_NSNumberInitWithUnsignedLongLongImp;
-
-+ (void)load
-{
-  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init]; // Though technically not required, the run time environment at +load time may be less than ideal.
-  
-  _jk_NSNumberClass = [NSNumber class];
-  _jk_NSNumberAllocImp = (NSNumberAllocImp)[NSNumber methodForSelector:@selector(alloc)];
-  
-  // Hacktacular.  Need to do it this way due to the nature of class clusters.
-  id temp_NSNumber = [NSNumber alloc];
-  _jk_NSNumberInitWithUnsignedLongLongImp = (NSNumberInitWithUnsignedLongLongImp)[temp_NSNumber methodForSelector:@selector(initWithUnsignedLongLong:)];
-  [[temp_NSNumber init] release];
-  temp_NSNumber = NULL;
-  
-  [pool release]; pool = NULL;
-}
 
 + (id)decoder
 {
@@ -2310,20 +2155,8 @@ static void _JSONDecoderCleanup(JSONDecoder *decoder) {
 // This needs to be completely rewritten.
 static id _JKParseUTF8String(JKParseState *parseState, BOOL mutableCollections, const unsigned char *string, size_t length, NSError **error) {
   NSCParameterAssert((parseState != NULL) && (string != NULL) && (parseState->cache.prng_lfsr != 0U));
-
-  NSMutableData *decompressedData = NULL;
-  const unsigned char *useString = string;
-  size_t               useLength = length;
-
-  if((length > 6UL) && (string[0] == 0x1fU) && (string[1] == 0x8bU)) {
-    if((decompressedData = jk_zlib_decompress(string, length, error)) == NULL) { return(NULL); }
-    useLength = [decompressedData length];
-    useString = [decompressedData bytes];
-  }
-  
-
-  parseState->stringBuffer.bytes.ptr    = useString;
-  parseState->stringBuffer.bytes.length = useLength;
+  parseState->stringBuffer.bytes.ptr    = string;
+  parseState->stringBuffer.bytes.length = length;
   parseState->atIndex                   = 0UL;
   parseState->lineNumber                = 1UL;
   parseState->lineStartIndex            = 0UL;
@@ -2348,7 +2181,6 @@ static id _JKParseUTF8String(JKParseState *parseState, BOOL mutableCollections, 
   
   jk_managedBuffer_release(&parseState->token.tokenBuffer);
   jk_objectStack_release(&parseState->objectStack);
-  if(decompressedData != NULL) { [decompressedData setLength:0UL]; }
   
   parseState->stringBuffer.bytes.ptr    = NULL;
   parseState->stringBuffer.bytes.length = 0UL;
@@ -2717,7 +2549,6 @@ static int jk_encode_add_atom_to_buffer(JKEncodeState *encodeState, void *object
                        ((encodeState->stringBuffer.bytes.ptr + cacheSlot->offset)                        < (encodeState->stringBuffer.bytes.ptr + encodeState->stringBuffer.bytes.length)) &&
                        ((encodeState->stringBuffer.bytes.ptr + cacheSlot->offset + cacheSlot->length)    < (encodeState->stringBuffer.bytes.ptr + encodeState->stringBuffer.bytes.length)) &&
                        ((encodeState->stringBuffer.bytes.ptr + cacheSlot->offset + cacheSlot->length)    < (encodeState->stringBuffer.bytes.ptr + encodeState->atIndex)));
-    NSCParameterAssert((cacheSlot->object != NULL) && (cacheSlot->offset < encodeState->stringBuffer.bytes.length) && ((cacheSlot->offset + cacheSlot->length) < encodeState->stringBuffer.bytes.length) && ((encodeState->atIndex + cacheSlot->length) < encodeState->stringBuffer.bytes.length));
     memcpy(encodeState->stringBuffer.bytes.ptr + encodeState->atIndex, encodeState->stringBuffer.bytes.ptr + cacheSlot->offset, cacheSlot->length);
     encodeState->atIndex += cacheSlot->length;
     return(0);
@@ -2725,20 +2556,57 @@ static int jk_encode_add_atom_to_buffer(JKEncodeState *encodeState, void *object
 
   // When we encounter a class that we do not handle, and we have either a delegate or block that the user supplied to format unsupported classes,
   // we "re-run" the object check.  However, we re-run the object check exactly ONCE.  If the user supplies an object that isn't one of the
-  // supported classes, we fail the second type (i.e., double fault error).
+  // supported classes, we fail the second time (i.e., double fault error).
   BOOL rerunningAfterClassFormatter = NO;
-rerunAfterClassFormatter:
-       if(JK_EXPECT_T(object->isa == encodeState->fastClassLookup.stringClass))     { isClass = JKClassString;     }
-  else if(JK_EXPECT_T(object->isa == encodeState->fastClassLookup.numberClass))     { isClass = JKClassNumber;     }
-  else if(JK_EXPECT_T(object->isa == encodeState->fastClassLookup.dictionaryClass)) { isClass = JKClassDictionary; }
-  else if(JK_EXPECT_T(object->isa == encodeState->fastClassLookup.arrayClass))      { isClass = JKClassArray;      }
-  else if(JK_EXPECT_T(object->isa == encodeState->fastClassLookup.nullClass))       { isClass = JKClassNull;       }
+ rerunAfterClassFormatter:;
+
+  // XXX XXX XXX XXX
+  //     
+  //     We need to work around a bug in 10.7, which breaks ABI compatibility with Objective-C going back not just to 10.0, but OpenStep and even NextStep.
+  //     
+  //     It has long been documented that "the very first thing that a pointer to an Objective-C object "points to" is a pointer to that objects class".
+  //     
+  //     This is euphemistically called "tagged pointers".  There are a number of highly technical problems with this, most involving long passages from
+  //     the C standard(s).  In short, one can make a strong case, couched from the perspective of the C standard(s), that that 10.7 "tagged pointers" are
+  //     fundamentally Wrong and Broken, and should have never been implemented.  Assuming those points are glossed over, because the change is very clearly
+  //     breaking ABI compatibility, this should have resulted in a minimum of a "minimum version required" bump in various shared libraries to prevent
+  //     causes code that used to work just fine to suddenly break without warning.
+  //
+  //     In fact, the C standard says that the hack below is "undefined behavior"- there is no requirement that the 10.7 tagged pointer hack of setting the
+  //     "lower, unused bits" must be preserved when casting the result to an integer type, but this "works" because for most architectures
+  //     `sizeof(long) == sizeof(void *)` and the compiler uses the same representation for both.  (note: this is informal, not meant to be
+  //     normative or pedantically correct).
+  //     
+  //     In other words, while this "works" for now, technically the compiler is not obligated to do "what we want", and a later version of the compiler
+  //     is not required in any way to produce the same results or behavior that earlier versions of the compiler did for the statement below.
+  //
+  //     Fan-fucking-tastic.
+  //     
+  //     Why not just use `object_getClass()`?  Because `object->isa` reduces to (typically) a *single* instruction.  Calling `object_getClass()` requires
+  //     that the compiler potentially spill registers, establish a function call frame / environment, and finally execute a "jump subroutine" instruction.
+  //     Then, the called subroutine must spend half a dozen instructions in its prolog, however many instructions doing whatever it does, then half a dozen
+  //     instructions in its prolog.  One instruction compared to dozens, maybe a hundred instructions.
+  //     
+  //     Yes, that's one to two orders of magnitude difference.  Which is compelling in its own right.  When going for performance, you're often happy with
+  //     gains in the two to three percent range.
+  //     
+  // XXX XXX XXX XXX
+
+  BOOL workAroundMacOSXABIBreakingBug = NO;
+  if(JK_EXPECT_F(((NSUInteger)object) & 0x1)) { workAroundMacOSXABIBreakingBug = YES; goto slowClassLookup; }
+
+       if(JK_EXPECT_T(object_getClass(object) == encodeState->fastClassLookup.stringClass))     { isClass = JKClassString;     }
+  else if(JK_EXPECT_T(object_getClass(object) == encodeState->fastClassLookup.numberClass))     { isClass = JKClassNumber;     }
+  else if(JK_EXPECT_T(object_getClass(object) == encodeState->fastClassLookup.dictionaryClass)) { isClass = JKClassDictionary; }
+  else if(JK_EXPECT_T(object_getClass(object) == encodeState->fastClassLookup.arrayClass))      { isClass = JKClassArray;      }
+  else if(JK_EXPECT_T(object_getClass(object) == encodeState->fastClassLookup.nullClass))       { isClass = JKClassNull;       }
   else {
-         if(JK_EXPECT_T([object isKindOfClass:[NSString     class]])) { encodeState->fastClassLookup.stringClass     = object->isa; isClass = JKClassString;     }
-    else if(JK_EXPECT_T([object isKindOfClass:[NSNumber     class]])) { encodeState->fastClassLookup.numberClass     = object->isa; isClass = JKClassNumber;     }
-    else if(JK_EXPECT_T([object isKindOfClass:[NSDictionary class]])) { encodeState->fastClassLookup.dictionaryClass = object->isa; isClass = JKClassDictionary; }
-    else if(JK_EXPECT_T([object isKindOfClass:[NSArray      class]])) { encodeState->fastClassLookup.arrayClass      = object->isa; isClass = JKClassArray;      }
-    else if(JK_EXPECT_T([object isKindOfClass:[NSNull       class]])) { encodeState->fastClassLookup.nullClass       = object->isa; isClass = JKClassNull;       }
+  slowClassLookup:
+         if(JK_EXPECT_T([object isKindOfClass:[NSString     class]])) { if(workAroundMacOSXABIBreakingBug == NO) { encodeState->fastClassLookup.stringClass     = object_getClass(object); } isClass = JKClassString;     }
+    else if(JK_EXPECT_T([object isKindOfClass:[NSNumber     class]])) { if(workAroundMacOSXABIBreakingBug == NO) { encodeState->fastClassLookup.numberClass     = object_getClass(object); } isClass = JKClassNumber;     }
+    else if(JK_EXPECT_T([object isKindOfClass:[NSDictionary class]])) { if(workAroundMacOSXABIBreakingBug == NO) { encodeState->fastClassLookup.dictionaryClass = object_getClass(object); } isClass = JKClassDictionary; }
+    else if(JK_EXPECT_T([object isKindOfClass:[NSArray      class]])) { if(workAroundMacOSXABIBreakingBug == NO) { encodeState->fastClassLookup.arrayClass      = object_getClass(object); } isClass = JKClassArray;      }
+    else if(JK_EXPECT_T([object isKindOfClass:[NSNull       class]])) { if(workAroundMacOSXABIBreakingBug == NO) { encodeState->fastClassLookup.nullClass       = object_getClass(object); } isClass = JKClassNull;       }
     else {
       if((rerunningAfterClassFormatter == NO) && (
 #ifdef __BLOCKS__
@@ -2783,7 +2651,7 @@ rerunAfterClassFormatter:
                   default: if(JK_EXPECT_F(jk_encode_printf(encodeState, NULL, 0UL, NULL, "\\u%4.4x", utf8String[utf8Idx]))) { return(1); } break;
                 }
               } else {
-                if(JK_EXPECT_F(utf8String[utf8Idx] == '\"') || JK_EXPECT_F(utf8String[utf8Idx] == '\\')) { encodeState->stringBuffer.bytes.ptr[encodeState->atIndex++] = '\\'; }
+                if(JK_EXPECT_F(utf8String[utf8Idx] == '\"') || JK_EXPECT_F(utf8String[utf8Idx] == '\\') || (JK_EXPECT_F(encodeState->serializeOptionFlags & JKSerializeOptionEscapeForwardSlashes) && JK_EXPECT_F(utf8String[utf8Idx] == '/'))) { encodeState->stringBuffer.bytes.ptr[encodeState->atIndex++] = '\\'; }
                 encodeState->stringBuffer.bytes.ptr[encodeState->atIndex++] = utf8String[utf8Idx];
               }
             }
@@ -2837,7 +2705,7 @@ rerunAfterClassFormatter:
                   else                              { if(JK_EXPECT_F(jk_encode_printf(encodeState, NULL, 0UL, NULL, "\\u%4.4x\\u%4.4x", (0xd7c0U + (u32ch >> 10)), (0xdc00U + (u32ch & 0x3ffU))))) { return(1); } }
                 }
               } else {
-                if(JK_EXPECT_F(utf8String[utf8Idx] == '\"') || JK_EXPECT_F(utf8String[utf8Idx] == '\\')) { encodeState->stringBuffer.bytes.ptr[encodeState->atIndex++] = '\\'; }
+                if(JK_EXPECT_F(utf8String[utf8Idx] == '\"') || JK_EXPECT_F(utf8String[utf8Idx] == '\\') || (JK_EXPECT_F(encodeState->serializeOptionFlags & JKSerializeOptionEscapeForwardSlashes) && JK_EXPECT_F(utf8String[utf8Idx] == '/'))) { encodeState->stringBuffer.bytes.ptr[encodeState->atIndex++] = '\\'; }
                 encodeState->stringBuffer.bytes.ptr[encodeState->atIndex++] = utf8String[utf8Idx];
               }
             }
@@ -2884,7 +2752,7 @@ rerunAfterClassFormatter:
               double dv;
               if(JK_EXPECT_T(CFNumberGetValue((CFNumberRef)object, kCFNumberDoubleType, &dv))) {
                 if(JK_EXPECT_F(!isfinite(dv))) { jk_encode_error(encodeState, @"Floating point values must be finite.  JSON does not support NaN or Infinity."); return(1); }
-                return(jk_encode_printf(encodeState, cacheSlot, startingAtIndex, encodeCacheObject, ((encodeState->serializeOptionFlags & JKSerializeOptionExtendedFloatingPoint) == 0) ? "%.17g" : "%a", dv));
+                return(jk_encode_printf(encodeState, cacheSlot, startingAtIndex, encodeCacheObject, "%.17g", dv));
               } else { jk_encode_error(encodeState, @"Unable to get floating point value from number object."); return(1); }
             }
             break;
@@ -2920,7 +2788,7 @@ rerunAfterClassFormatter:
           for(id keyObject in enumerateObject) {
             if(JK_EXPECT_T(printComma)) { if(JK_EXPECT_F(jk_encode_write1(encodeState, 0L, ","))) { return(1); } }
             printComma = 1;
-            if(JK_EXPECT_F((keyObject->isa      != encodeState->fastClassLookup.stringClass)) && JK_EXPECT_F(([keyObject   isKindOfClass:[NSString class]] == NO))) { jk_encode_error(encodeState, @"Key must be a string object."); return(1); }
+            if(JK_EXPECT_F((object_getClass(keyObject)      != encodeState->fastClassLookup.stringClass)) && JK_EXPECT_F(([keyObject   isKindOfClass:[NSString class]] == NO))) { jk_encode_error(encodeState, @"Key must be a string object."); return(1); }
             if(JK_EXPECT_F(jk_encode_add_atom_to_buffer(encodeState, keyObject)))                                                        { return(1); }
             if(JK_EXPECT_F(jk_encode_write1(encodeState, 0L, ":")))                                                                      { return(1); }
             if(JK_EXPECT_F(jk_encode_add_atom_to_buffer(encodeState, (void *)CFDictionaryGetValue((CFDictionaryRef)object, keyObject)))) { return(1); }
@@ -2931,7 +2799,7 @@ rerunAfterClassFormatter:
           for(idx = 0L; idx < dictionaryCount; idx++) {
             if(JK_EXPECT_T(printComma)) { if(JK_EXPECT_F(jk_encode_write1(encodeState, 0L, ","))) { return(1); } }
             printComma = 1;
-            if(JK_EXPECT_F(((id)keys[idx])->isa != encodeState->fastClassLookup.stringClass) && JK_EXPECT_F([(id)keys[idx] isKindOfClass:[NSString class]] == NO)) { jk_encode_error(encodeState, @"Key must be a string object."); return(1); }
+            if(JK_EXPECT_F(object_getClass(((id)keys[idx])) != encodeState->fastClassLookup.stringClass) && JK_EXPECT_F([(id)keys[idx] isKindOfClass:[NSString class]] == NO)) { jk_encode_error(encodeState, @"Key must be a string object."); return(1); }
             if(JK_EXPECT_F(jk_encode_add_atom_to_buffer(encodeState, keys[idx])))    { return(1); }
             if(JK_EXPECT_F(jk_encode_write1(encodeState, 0L, ":")))                  { return(1); }
             if(JK_EXPECT_F(jk_encode_add_atom_to_buffer(encodeState, objects[idx]))) { return(1); }
@@ -2969,7 +2837,7 @@ rerunAfterClassFormatter:
   id returnObject = NULL;
 
   if(encodeState != NULL) { [self releaseState]; }
-  if((encodeState = (struct JKEncodeState *)calloc(1UL, sizeof(JKEncodeState))) == NULL) { [NSException exceptionWithName:NSMallocException reason:@"Unable to allocate state structure." userInfo:NULL]; return(NULL); }
+  if((encodeState = (struct JKEncodeState *)calloc(1UL, sizeof(JKEncodeState))) == NULL) { [NSException raise:NSMallocException format:@"Unable to allocate state structure."]; return(NULL); }
 
   if((error != NULL) && (*error != NULL)) { *error = NULL; }
 
